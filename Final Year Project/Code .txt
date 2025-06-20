@@ -1,0 +1,199 @@
+#include "driver/ledc.h"
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include "esp_camera.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
+#include "esp32_face_recognition.h"  // Add face recognition library
+
+// WiFi credentials
+const char* ssid = "VYANKATESH";   
+const char* password = "ramramram";   
+
+// Telegram bot credentials
+const String token = "7900583780:AAGAMK-k3Tfh61Z8DOz-Cv78KLG-jBx1wfY";
+const String chat_id = "1186014886";
+
+// Camera pin configuration for AI-THINKER model
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+const int gpioPIR = 13;  // PIR motion sensor pin
+
+// Face recognition variables
+#define FACE_THRESHOLD 0.8 // Adjust this threshold for matching faces
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detection
+  Serial.begin(115200);
+  pinMode(gpioPIR, INPUT_PULLUP);
+
+  // Connect to WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - startTime > 10000) { // Timeout after 10 seconds
+      Serial.println("\nWiFi Connection Failed! Restarting...");
+      ESP.restart();
+    }
+  }
+
+  Serial.println("\nConnected to WiFi");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize the camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;  
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_QQVGA;
+    config.jpeg_quality = 12;  
+    config.fb_count = 1;
+  }
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera initialization failed! Restarting...");
+    ESP.restart();
+  }
+  Serial.println("Camera initialized successfully.");
+
+  // Initialize Face Recognition (Optional: add face database if needed)
+  faceRecognition.begin();
+}
+
+void loop() {
+  int motionDetected = digitalRead(gpioPIR);
+  Serial.println(motionDetected);
+
+  if (motionDetected == HIGH) {
+    Serial.println("Motion detected! Checking for known faces...");
+    bool isKnownFace = recognizeFace();
+    if (!isKnownFace) {
+      Serial.println("Unknown face detected! Sending alert to Telegram...");
+      sendImageToTelegram();
+    } else {
+      Serial.println("Known face detected. No alert sent.");
+    }
+    delay(10000);  // Avoid multiple triggers
+  }
+
+  delay(1000);
+}
+
+bool recognizeFace() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed!");
+    return false;
+  }
+
+  // Face recognition
+  float confidence = faceRecognition.match(fb->buf, fb->len);  // Adjust this method based on the library you're using
+
+  esp_camera_fb_return(fb);
+
+  if (confidence > FACE_THRESHOLD) {
+    Serial.println("Face recognized with confidence: " + String(confidence));
+    return true;  // Known face
+  } else {
+    return false; // Unknown face
+  }
+}
+
+void sendImageToTelegram() {
+  const char* server = "api.telegram.org";
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip SSL verification
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed!");
+    return;
+  }
+
+  if (!client.connect(server, 443)) {
+    Serial.println("Connection to Telegram failed!");
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  String boundary = "----WebKitFormBoundary";
+  String head = "--" + boundary + "\r\n" +
+                "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
+                chat_id + "\r\n--" + boundary + "\r\n" +
+                "Content-Disposition: form-data; name=\"photo\"; filename=\"image.jpg\"\r\n" +
+                "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  uint16_t totalLength = head.length() + fb->len + tail.length();
+
+  client.println("POST /bot" + token + "/sendPhoto HTTP/1.1");
+  client.println("Host: " + String(server));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Content-Length: " + String(totalLength));
+  client.println();
+  client.print(head);
+
+  // Send image data
+  client.write(fb->buf, fb->len);
+  client.print(tail);
+
+  esp_camera_fb_return(fb);
+
+  unsigned long timeout = millis();
+  while (client.connected() && millis() - timeout < 5000) {
+    while (client.available()) {
+      Serial.write(client.read());
+      timeout = millis();
+    }
+  }
+  client.stop();
+  Serial.println("\nImage sent to Telegram!");
+}
